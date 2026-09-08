@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { Sun, Cloud, CloudRain, MapPin, Info, AlertTriangle, ArrowUp } from 'lucide-react';
 import { MapContainer, TileLayer, CircleMarker, Tooltip, Popup, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
@@ -117,6 +117,24 @@ function localDateKey(d) {
   return `${y}-${m}-${day}`;
 }
 
+// Reduces a station's recent observations down to one reading per local hour
+// for today only, keeping whichever reading in that hour is closest to the
+// top of the hour.
+function matchObservedToHours(readings) {
+  const todayKey = localDateKey(new Date());
+  const byHour = {};
+  readings.forEach((r) => {
+    const d = new Date(r.time);
+    if (localDateKey(d) !== todayKey) return;
+    const hour = d.getHours();
+    const existing = byHour[hour];
+    if (!existing || Math.abs(d.getMinutes()) < Math.abs(new Date(existing.time).getMinutes())) {
+      byHour[hour] = r;
+    }
+  });
+  return byHour;
+}
+
 // WMO weather codes, collapsed down to the three sky states this UI shows.
 function weatherCodeToSky(code) {
   if (code === 0) return 'sun';
@@ -194,6 +212,27 @@ function SkyIcon({ sky, size = 14 }) {
 
 // Fits the map view to show every spot on first render; user's own pan/zoom
 // afterward is left alone since this only runs once (empty effect deps beyond points).
+// Windfinder's widget is a legacy script tag that calls document.write()
+// internally -- browsers won't re-run a script just because its src changes,
+// so switching spots requires fully removing and recreating the script
+// element each time, which this effect does manually.
+function WindfinderWidget({ slug }) {
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    container.innerHTML = '';
+    if (!slug) return;
+    const script = document.createElement('script');
+    script.src = `https://www.windfinder.com/widget/forecast/js/${slug}?unit_wind=mph&unit_temperature=f&unit_rain=in&unit_wave=ft&days=3&show_day=1&show_pressure=0&show_waves=0&show_clouds=1`;
+    script.async = false;
+    container.appendChild(script);
+  }, [slug]);
+
+  return <div ref={containerRef} />;
+}
+
 function FitBounds({ points }) {
   const map = useMap();
   useEffect(() => {
@@ -212,6 +251,30 @@ export default function Dashboard({ spots }) {
   const [loading, setLoading] = useState(true);
   const [fallbackIds, setFallbackIds] = useState(new Set());
   const [modelPref, setModelPref] = useState({});
+  const [observedByStation, setObservedByStation] = useState({});
+
+  // Fetch NOAA station observations for whichever spot is selected, once per
+  // station (several spots can share a station, e.g. both Bde Maka Ska ones).
+  useEffect(() => {
+    const spot = spots.find((s) => s.id === selected);
+    const stationId = spot && spot.noaaStation && spot.noaaStation.id;
+    if (!stationId || observedByStation[stationId]) return;
+    let cancelled = false;
+    fetch(`/api/observed?station=${stationId}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('failed'))))
+      .then((data) => {
+        if (cancelled) return;
+        setObservedByStation((prev) => ({ ...prev, [stationId]: data.readings || [] }));
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setObservedByStation((prev) => ({ ...prev, [stationId]: [] }));
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected, spots]);
 
   // If the spot list grows (community spot approved) after mount and nothing
   // is selected yet, default to the first one.
@@ -467,9 +530,26 @@ export default function Dashboard({ spots }) {
           </div>
         ) : (
           (() => {
-            const rawMax = Math.max(...activeScore.scored.flatMap((h) => [h.speed, h.gust]));
+            const observedByHour =
+              dayIdx === 0 && activeSpot.noaaStation
+                ? matchObservedToHours(observedByStation[activeSpot.noaaStation.id] || [])
+                : {};
+            const observedSpeeds = Object.values(observedByHour).map((r) => r.speedMph);
+            const rawMax = Math.max(...activeScore.scored.flatMap((h) => [h.speed, h.gust]), ...observedSpeeds, 0);
             const scaleMax = Math.max(CHART_MIN_SCALE_MPH, Math.ceil(rawMax / TICK_STEP) * TICK_STEP);
             const ticks = Array.from({ length: scaleMax / TICK_STEP + 1 }, (_, i) => i * TICK_STEP);
+            const observedPoints = activeScore.scored
+              .map((h, i) => {
+                const obs = observedByHour[h.hour];
+                if (!obs) return null;
+                return {
+                  x: ((i + 0.5) / activeScore.scored.length) * 100,
+                  yFromBottom: Math.min(100, (obs.speedMph / scaleMax) * 100),
+                  speedMph: obs.speedMph,
+                  hour: h.hour,
+                };
+              })
+              .filter(Boolean);
             return (
               <>
                 <div style={{ display: 'flex', gap: 2, minWidth: 620 }}>
@@ -542,8 +622,49 @@ export default function Dashboard({ spots }) {
                         );
                       })}
                     </div>
+                    {observedPoints.length > 0 && (
+                      <svg
+                        viewBox="0 0 100 100"
+                        preserveAspectRatio="none"
+                        style={{ position: 'absolute', inset: 0, pointerEvents: 'none' }}
+                      >
+                        <polyline
+                          points={observedPoints.map((p) => `${p.x},${100 - p.yFromBottom}`).join(' ')}
+                          fill="none"
+                          stroke={COLORS.ink}
+                          strokeWidth="1.5"
+                          strokeDasharray="4 3"
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      </svg>
+                    )}
+                    {observedPoints.map((p) => (
+                      <div
+                        key={p.hour}
+                        title={`observed ${p.speedMph} mph at ${activeSpot.noaaStation.id}`}
+                        style={{
+                          position: 'absolute',
+                          left: `${p.x}%`,
+                          bottom: `${p.yFromBottom}%`,
+                          transform: 'translate(-50%, 50%)',
+                          width: 7,
+                          height: 7,
+                          borderRadius: '50%',
+                          background: COLORS.ink,
+                          border: `1px solid ${COLORS.paper}`,
+                        }}
+                      />
+                    ))}
                   </div>
                 </div>
+
+                {dayIdx === 0 && activeSpot.noaaStation && (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 8, fontSize: 11, color: COLORS.inkSoft }}>
+                    <span style={{ width: 14, borderTop: `1px dashed ${COLORS.ink}`, display: 'inline-block' }} />
+                    Observed at {activeSpot.noaaStation.name} ({activeSpot.noaaStation.id})
+                    {observedPoints.length === 0 && ' \u2014 no readings yet today'}
+                  </div>
+                )}
 
                 <div style={{ display: 'flex', gap: 2, minWidth: 620, marginTop: 10 }}>
                   <div style={{ width: AXIS_WIDTH, flexShrink: 0 }} />
@@ -591,6 +712,19 @@ export default function Dashboard({ spots }) {
           Good: 12–28 mph sustained in a working direction. Marginal: 9–11 mph, 29+ mph, or under 9 mph with gusts over 20.
           Click a dot on the map to load that spot's hourly chart above.
         </span>
+      </div>
+
+      <div style={{ marginTop: 32, paddingTop: 20, borderTop: `1px solid ${COLORS.paperLine}` }}>
+        <div className="sg" style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
+          Cross-check on Windfinder — {activeSpot.name}
+        </div>
+        {activeSpot.windfinderSlug ? (
+          <WindfinderWidget slug={activeSpot.windfinderSlug} />
+        ) : (
+          <p style={{ fontSize: 13, color: COLORS.inkSoft }}>
+            No Windfinder location matched to this spot yet.
+          </p>
+        )}
       </div>
     </div>
   );

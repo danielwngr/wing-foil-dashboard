@@ -3,6 +3,8 @@
 export const OFFICIAL_SPOTS = [
   {
     id: 'se-bdemakaska',
+    noaaStation: { id: 'KMSP', name: 'Minneapolis–St. Paul Intl' },
+    windfinderSlug: 'lake_calhoun_minneapolis',
     name: 'SE Bde Maka Ska',
     lat: 44.934344,
     lon: -93.308645,
@@ -11,6 +13,8 @@ export const OFFICIAL_SPOTS = [
   },
   {
     id: 'n-bdemakaska',
+    noaaStation: { id: 'KMSP', name: 'Minneapolis–St. Paul Intl' },
+    windfinderSlug: 'lake_calhoun_minneapolis',
     name: 'North Bde Maka Ska',
     lat: 44.9490395,
     lon: -93.3139819,
@@ -19,14 +23,18 @@ export const OFFICIAL_SPOTS = [
   },
   {
     id: 'waconia',
+    noaaStation: { id: 'KMSP', name: 'Minneapolis–St. Paul Intl' },
+    windfinderSlug: 'waconia_minnesota_usa',
     name: 'Waconia',
     lat: 44.872499,
     lon: -93.759354,
-    sectors: [[300, 360], [0, 30]],
-    description: 'Works N or NW',
+    sectors: [[202.5, 337.5]],
+    description: 'Works W, SW, or NW',
   },
   {
     id: 'wisconsin-point',
+    noaaStation: { id: 'KDLH', name: 'Duluth Intl' },
+    windfinderSlug: 'park_point_duluth',
     name: 'Point Wisconsin',
     lat: 46.7051173,
     lon: -92.0099167,
@@ -35,6 +43,8 @@ export const OFFICIAL_SPOTS = [
   },
   {
     id: 'father-hennepin',
+    noaaStation: { id: 'KBRD', name: 'Brainerd Lakes Regional' },
+    windfinderSlug: 'mille_lacs_father_hennepin_state_park',
     name: 'Father Hennepin',
     lat: 46.14472,
     lon: -93.48806,
@@ -43,6 +53,8 @@ export const OFFICIAL_SPOTS = [
   },
   {
     id: 'pepin-roadside-park',
+    noaaStation: { id: 'KRGK', name: 'Red Wing Regional' },
+    windfinderSlug: 'lake_city_mn_lake_pepin',
     name: 'Lake Pepin \u2013 Roadside Park',
     lat: 44.4696,
     lon: -92.2908,
@@ -51,6 +63,8 @@ export const OFFICIAL_SPOTS = [
   },
   {
     id: 'pepin-the-point-lake-city',
+    noaaStation: { id: 'KRGK', name: 'Red Wing Regional' },
+    windfinderSlug: 'lake_city_mn_lake_pepin',
     name: 'Lake Pepin \u2013 The Point (Lake City)',
     lat: 44.449564,
     lon: -92.263131,
@@ -59,6 +73,8 @@ export const OFFICIAL_SPOTS = [
   },
   {
     id: 'pepin-marina-wi',
+    noaaStation: { id: 'KRGK', name: 'Red Wing Regional' },
+    windfinderSlug: 'lake_city_mn_lake_pepin',
     name: 'Lake Pepin \u2013 Pepin Marina (WI)',
     lat: 44.4381705,
     lon: -92.1460796,
