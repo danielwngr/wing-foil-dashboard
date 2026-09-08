@@ -48,11 +48,22 @@ export default async function handler(req, res) {
     }
 
     if (lat === undefined || lon === undefined || Number.isNaN(lat) || Number.isNaN(lon)) {
-      return res.status(422).json({ error: "Couldn't find coordinates in that link." });
+      // Diagnostic info baked directly into the error message (not just
+      // server logs) since that's the only way to actually see what
+      // happened without Vercel log access -- this has failed silently
+      // twice now, so guessing again isn't useful without evidence.
+      const redirected = finalUrl !== url;
+      const snippet = text.replace(/\s+/g, ' ').trim().slice(0, 150);
+      return res.status(422).json({
+        error:
+          `Couldn't find coordinates. HTTP ${r.status}, ` +
+          `${redirected ? `redirected to ${finalUrl.slice(0, 120)}` : 'no redirect happened'}, ` +
+          `page snippet: "${snippet}"`,
+      });
     }
 
     return res.status(200).json({ lat, lon });
   } catch (err) {
-    return res.status(500).json({ error: "Couldn't resolve that link." });
+    return res.status(500).json({ error: `Couldn't resolve that link: ${err.message || err}` });
   }
 }

@@ -164,15 +164,17 @@ function buildDaysFromHourly(hourly) {
     const [datePart, timePart] = t.split('T');
     const hourNum = parseInt(timePart.slice(0, 2), 10);
     if (!HOURS.includes(hourNum)) return;
+    if (hourly.windspeed_10m[i] == null || hourly.winddirection_10m[i] == null) return;
     if (!byDate[datePart]) byDate[datePart] = [];
     byDate[datePart].push({
       hour: hourNum,
       dir: Math.round(hourly.winddirection_10m[i]),
       speed: Math.round(hourly.windspeed_10m[i]),
-      gust: Math.round(hourly.windgusts_10m[i]),
-      temp: Math.round(hourly.temperature_2m[i]),
-      sky: weatherCodeToSky(hourly.weathercode[i]),
-      rain: weatherCodeToRainFlag(hourly.weathercode[i]) ? 100 : 0,
+      gust: Math.round(hourly.windgusts_10m[i] ?? hourly.windspeed_10m[i]),
+      temp: Math.round(hourly.temperature_2m[i] ?? 0),
+      sky: weatherCodeToSky(hourly.weathercode[i] ?? 0),
+      rain: weatherCodeToRainFlag(hourly.weathercode[i] ?? 0) ? 100 : 0,
+      agreement: hourly.agreement ? hourly.agreement[i] : undefined,
     });
   });
 
@@ -185,19 +187,22 @@ function buildDaysFromHourly(hourly) {
   });
 }
 
-// Selectable forecast sources. 'best_match' omits the models param entirely
-// (Open-Meteo's own auto-selection). For Minnesota/Wisconsin coordinates this
-// is very likely equivalent to gfs_seamless, since Open-Meteo's NOAA endpoint
-// already blends HRRR into GFS for any US location - icon_seamless and
-// ecmwf_ifs025 are included because they're independent global models (German
-// and European respectively) and give a genuinely different second opinion.
+// Selectable forecast sources. 'consensus' (see below) is the recommended
+// default. 'best_match' omits the models param entirely (Open-Meteo's own
+// auto-selection). For Minnesota/Wisconsin coordinates this is very likely
+// equivalent to gfs_seamless, since Open-Meteo's NOAA endpoint already blends
+// HRRR into GFS for any US location - icon_seamless and ecmwf_ifs025 are
+// included because they're independent global models (German and European
+// respectively) and give a genuinely different second opinion.
 const MODEL_OPTIONS = [
+  { key: 'consensus', label: 'Consensus (recommended)' },
   { key: 'best_match', label: 'Best match (auto)' },
   { key: 'gfs_seamless', label: 'NOAA GFS + HRRR' },
   { key: 'ncep_hrrr_conus', label: 'NOAA HRRR only (~2 day range)' },
   { key: 'icon_seamless', label: 'DWD ICON (Germany)' },
   { key: 'ecmwf_ifs025', label: 'ECMWF IFS' },
 ];
+const DEFAULT_MODEL = 'consensus';
 
 async function fetchSpotForecast(spot, modelKey) {
   const modelParam = modelKey && modelKey !== 'best_match' ? `&models=${modelKey}` : '';
@@ -209,6 +214,135 @@ async function fetchSpotForecast(spot, modelKey) {
   if (!res.ok) throw new Error(`forecast request failed (${res.status})`);
   const data = await res.json();
   return buildDaysFromHourly(data.hourly);
+}
+
+// --- Consensus forecasting ---
+// For each hour: if HRRR (the short-range specialist) actually has data for
+// that hour, trust it directly. Beyond HRRR's window, take a real consensus
+// across GFS+HRRR-blend, DWD ICON, and ECMWF -- if two of the three agree
+// within tolerance, average just those two and treat the third as the
+// outlier; if all three agree, average all three; if none agree, average
+// everything and say so, rather than silently picking one.
+const CONSENSUS_MODELS = ['gfs_seamless', 'icon_seamless', 'ecmwf_ifs025'];
+const AGREE_TOL_SPEED_MPH = 4;
+const AGREE_TOL_TEMP_F = 4;
+const AGREE_TOL_DIR_DEG = 35;
+
+async function fetchModelHourlyRaw(spot, modelKey) {
+  const modelParam = modelKey ? `&models=${modelKey}` : '';
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${spot.lat}&longitude=${spot.lon}` +
+    `&hourly=temperature_2m,windspeed_10m,winddirection_10m,windgusts_10m,weathercode` +
+    `&windspeed_unit=mph&temperature_unit=fahrenheit&timezone=auto&forecast_days=9${modelParam}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`forecast request failed (${res.status})`);
+  const data = await res.json();
+  const h = data.hourly;
+  const byTime = {};
+  h.time.forEach((t, i) => {
+    byTime[t] = {
+      dir: h.winddirection_10m[i],
+      speed: h.windspeed_10m[i],
+      gust: h.windgusts_10m[i],
+      temp: h.temperature_2m[i],
+      weathercode: h.weathercode[i],
+    };
+  });
+  return byTime;
+}
+
+function pickConsensusNumeric(values, tolerance) {
+  if (!values.length) return null;
+  if (values.length === 1) return { value: values[0], agreement: '1 source' };
+  let best = null;
+  for (let i = 0; i < values.length; i++) {
+    for (let j = i + 1; j < values.length; j++) {
+      const diff = Math.abs(values[i] - values[j]);
+      if (!best || diff < best.diff) best = { diff, i, j };
+    }
+  }
+  const pairAvg = (values[best.i] + values[best.j]) / 2;
+  if (best.diff <= tolerance) {
+    const included = values.filter((v) => Math.abs(v - pairAvg) <= tolerance);
+    const avg = included.reduce((s, v) => s + v, 0) / included.length;
+    return { value: avg, agreement: `${included.length}/${values.length} models agree` };
+  }
+  const avg = values.reduce((s, v) => s + v, 0) / values.length;
+  return { value: avg, agreement: `models disagree, averaged ${values.length}` };
+}
+
+function pickConsensusDirection(values, tolerance) {
+  if (!values.length) return null;
+  const angDiff = (a, b) => {
+    const d = Math.abs(a - b) % 360;
+    return d > 180 ? 360 - d : d;
+  };
+  const circularAvg = (list) => {
+    const x = list.reduce((s, v) => s + Math.cos((v * Math.PI) / 180), 0);
+    const y = list.reduce((s, v) => s + Math.sin((v * Math.PI) / 180), 0);
+    return (((Math.atan2(y, x) * 180) / Math.PI) + 360) % 360;
+  };
+  if (values.length === 1) return { value: values[0], agreement: '1 source' };
+  let best = null;
+  for (let i = 0; i < values.length; i++) {
+    for (let j = i + 1; j < values.length; j++) {
+      const diff = angDiff(values[i], values[j]);
+      if (!best || diff < best.diff) best = { diff, i, j };
+    }
+  }
+  if (best.diff <= tolerance) {
+    const pairAvg = circularAvg([values[best.i], values[best.j]]);
+    const included = values.filter((v) => angDiff(v, pairAvg) <= tolerance);
+    return { value: circularAvg(included), agreement: `${included.length}/${values.length} models agree` };
+  }
+  return { value: circularAvg(values), agreement: `models disagree, averaged ${values.length}` };
+}
+
+async function fetchConsensusForecast(spot) {
+  const [gfs, icon, ecmwf, hrrr] = await Promise.all([
+    fetchModelHourlyRaw(spot, 'gfs_seamless').catch(() => ({})),
+    fetchModelHourlyRaw(spot, 'icon_seamless').catch(() => ({})),
+    fetchModelHourlyRaw(spot, 'ecmwf_ifs025').catch(() => ({})),
+    fetchModelHourlyRaw(spot, 'ncep_hrrr_conus').catch(() => ({})),
+  ]);
+  const allTimes = new Set([...Object.keys(gfs), ...Object.keys(icon), ...Object.keys(ecmwf)]);
+  const combined = {};
+
+  allTimes.forEach((t) => {
+    const hrrrEntry = hrrr[t];
+    if (hrrrEntry && Number.isFinite(hrrrEntry.speed)) {
+      // HRRR is the short-range specialist -- trust it directly for
+      // whatever hours it actually covers.
+      combined[t] = { ...hrrrEntry, agreement: 'HRRR (short-range)' };
+      return;
+    }
+    const entries = [gfs[t], icon[t], ecmwf[t]].filter(Boolean);
+    const speedC = pickConsensusNumeric(entries.map((e) => e.speed).filter(Number.isFinite), AGREE_TOL_SPEED_MPH);
+    const gustC = pickConsensusNumeric(entries.map((e) => e.gust).filter(Number.isFinite), AGREE_TOL_SPEED_MPH);
+    const dirC = pickConsensusDirection(entries.map((e) => e.dir).filter(Number.isFinite), AGREE_TOL_DIR_DEG);
+    const tempC = pickConsensusNumeric(entries.map((e) => e.temp).filter(Number.isFinite), AGREE_TOL_TEMP_F);
+    const repEntry = entries.find((e) => Number.isFinite(e.weathercode));
+    combined[t] = {
+      speed: speedC ? speedC.value : null,
+      gust: gustC ? gustC.value : null,
+      dir: dirC ? dirC.value : null,
+      temp: tempC ? tempC.value : null,
+      weathercode: repEntry ? repEntry.weathercode : 0,
+      agreement: speedC ? speedC.agreement : 'no data',
+    };
+  });
+
+  const times = Array.from(allTimes).sort();
+  const hourly = {
+    time: times,
+    winddirection_10m: times.map((t) => combined[t].dir),
+    windspeed_10m: times.map((t) => combined[t].speed),
+    windgusts_10m: times.map((t) => combined[t].gust),
+    temperature_2m: times.map((t) => combined[t].temp),
+    weathercode: times.map((t) => combined[t].weathercode),
+    agreement: times.map((t) => combined[t].agreement),
+  };
+  return buildDaysFromHourly(hourly);
 }
 
 const scoreColor = (s) => (s === 'good' ? COLORS.go : s === 'marginal' ? COLORS.caution : COLORS.no);
@@ -300,8 +434,10 @@ export default function Dashboard({ spots }) {
       const fallback = new Set();
       const entries = await Promise.all(
         spots.map(async (s) => {
+          const model = modelPref[s.id] || DEFAULT_MODEL;
           try {
-            return [s.id, await fetchSpotForecast(s, modelPref[s.id] || 'best_match')];
+            const days = model === 'consensus' ? await fetchConsensusForecast(s) : await fetchSpotForecast(s, model);
+            return [s.id, days];
           } catch (err) {
             fallback.add(s.id);
             return [s.id, generateForecast()];
@@ -461,7 +597,7 @@ export default function Dashboard({ spots }) {
           Forecast source
           <select
             className="mono uiInput"
-            value={modelPref[selected] || 'best_match'}
+            value={modelPref[selected] || DEFAULT_MODEL}
             onChange={(e) => setModelPref((prev) => ({ ...prev, [selected]: e.target.value }))}
             style={{ fontSize: 11, padding: '5px 6px', border: `1px solid ${COLORS.paperLine}`, background: COLORS.paper, color: COLORS.ink }}
           >
@@ -626,7 +762,7 @@ export default function Dashboard({ spots }) {
                                   flexDirection: 'column-reverse',
                                 }}
                               >
-                                <div title={`sustained ${h.speed} mph`} style={{ height: `${sustainedFrac}%`, background: color }} />
+                                <div title={`sustained ${h.speed} mph${h.agreement ? ` (${h.agreement})` : ''}`} style={{ height: `${sustainedFrac}%`, background: color }} />
                                 <div title={`gust ${h.gust} mph`} style={{ height: `${gustFrac}%`, background: color, opacity: 0.4 }} />
                               </div>
                             </div>
